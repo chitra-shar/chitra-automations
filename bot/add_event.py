@@ -26,7 +26,7 @@ Return JSON only. No explanation, no markdown, no backticks.
 
 Timezone: Asia/Singapore
 
-If the message is a calendar event, return:
+If the message contains one calendar event, return a single object:
 {
   "intent": "add_event",
   "summary": "event title",
@@ -35,6 +35,8 @@ If the message is a calendar event, return:
   "end_time": "HH:MM or null",
   "location": "location or null"
 }
+
+If the message contains multiple calendar events, return a JSON array of such objects.
 
 If end_time is null, caller defaults to start_time + 1 hour.
 If not a calendar event, return: {"intent": "unknown"}"""
@@ -58,12 +60,26 @@ def _parse_with_claude(text: str, today: datetime.date) -> dict:
     return json.loads(raw)
 
 
-def _format_receipt(summary: str, date: datetime.date, start_time: datetime.time, end_time: datetime.time) -> str:
+def _format_event_line(summary: str, date: datetime.date, start_time: datetime.time, end_time: datetime.time) -> str:
     day_name = DAYS[date.weekday()]
     month_name = MONTHS[date.month]
     start_str = start_time.strftime("%-I:%M%p").lower().replace(":00", "").rstrip("m") + "m"
     end_str = end_time.strftime("%-I:%M%p").lower().replace(":00", "").rstrip("m") + "m"
-    return f"✅ {summary} added — {day_name} {date.day} {month_name}, {start_str}–{end_str}"
+    return f"{summary} — {day_name} {date.day} {month_name}, {start_str}–{end_str}"
+
+
+def _resolve_times(parsed: dict) -> tuple[datetime.date, datetime.time, datetime.time, str | None]:
+    date = datetime.date.fromisoformat(parsed["date"])
+    start_time = datetime.time.fromisoformat(parsed["start_time"])
+    end_time = (
+        datetime.time.fromisoformat(parsed["end_time"])
+        if parsed.get("end_time")
+        else None
+    )
+    if end_time is None:
+        end_dt = datetime.datetime.combine(date, start_time) + datetime.timedelta(hours=1)
+        end_time = end_dt.time()
+    return date, start_time, end_time, parsed.get("location")
 
 
 def handle(text: str, chat_id: int) -> None:
@@ -74,34 +90,36 @@ def handle(text: str, chat_id: int) -> None:
         log.error(f"Claude parse error: {e}")
         return
 
-    if parsed.get("intent") != "add_event":
+    events = parsed if isinstance(parsed, list) else [parsed]
+    events = [e for e in events if e.get("intent") == "add_event"]
+
+    if not events:
         return
 
-    try:
-        date = datetime.date.fromisoformat(parsed["date"])
-        start_time = datetime.time.fromisoformat(parsed["start_time"])
-        end_time = (
-            datetime.time.fromisoformat(parsed["end_time"])
-            if parsed.get("end_time")
-            else None
-        )
-        location = parsed.get("location")
+    lines = []
+    for event in events:
+        try:
+            date, start_time, end_time, location = _resolve_times(event)
+            gcal_client.create_event(
+                summary=event["summary"],
+                date=date,
+                start_time=start_time,
+                end_time=end_time,
+                location=location,
+            )
+            lines.append(_format_event_line(event["summary"], date, start_time, end_time))
+            log.info(f"Event created: {lines[-1]}")
+        except Exception as e:
+            log.error(f"Event creation error for '{event.get('summary')}': {e}")
 
-        if end_time is None:
-            import datetime as dt
-            end_dt = dt.datetime.combine(date, start_time) + dt.timedelta(hours=1)
-            end_time = end_dt.time()
+    if not lines:
+        return
 
-        gcal_client.create_event(
-            summary=parsed["summary"],
-            date=date,
-            start_time=start_time,
-            end_time=end_time,
-            location=location,
-        )
+    if len(lines) == 1:
+        receipt = f"✅ {lines[0]}"
+    else:
+        bullet_list = "\n".join(f"- {line}" for line in lines)
+        receipt = f"✅ {len(lines)} events added:\n{bullet_list}"
 
-        receipt = _format_receipt(parsed["summary"], date, start_time, end_time)
-        send_message(chat_id, receipt)
-        log.info(f"Event created: {receipt}")
-    except Exception as e:
-        log.error(f"Event creation error: {e}")
+    send_message(chat_id, receipt)
+    log.info(f"Receipt sent: {receipt}")
